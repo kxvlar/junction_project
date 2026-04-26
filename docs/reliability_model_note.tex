@@ -1,0 +1,294 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\title{Junction Reliability Model: Method, Strengths, and Limitations}
+\author{Keval Amin}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Project Goal}
+
+This project asks a product-facing data science question:
+\begin{quote}
+When is an early wearable-derived recovery signal reliable enough to show to a user or downstream product logic?
+\end{quote}
+
+The version 1 system answered this question with a hand-built confidence score. Version 2 reframes the problem as supervised learning with selective label observability:
+\begin{enumerate}[leftmargin=1.5em]
+    \item construct a label for whether an early signal was \emph{safe to show},
+    \item train a predictive model for that label,
+    \item use inverse probability weighting and doubly robust summaries to correct evaluation when only some rows later become verifiable.
+\end{enumerate}
+
+\section{What Version 1 Did}
+
+Version 1 was a heuristic reliability policy rather than a learned model. It assigned each row a confidence score between $0$ and $1$ using a weighted combination of interpretable features:
+\[
+\text{confidence}_i
+=
+0.35 \cdot \text{completeness}_{7d,i}
++ 0.25 \cdot \text{backfill}_i
++ 0.20 \cdot \text{baseline}_i
++ 0.10 \cdot \text{stability}_i
++ 0.10 \cdot \text{agreement}_i.
+\]
+
+This score was then mapped into three actions:
+\begin{align*}
+\texttt{show} &\quad \text{if confidence} \ge 0.75, \\
+\texttt{show\_with\_warning} &\quad \text{if } 0.50 \le \text{confidence} < 0.75, \\
+\texttt{suppress} &\quad \text{if confidence} < 0.50.
+\end{align*}
+
+The main strength of Version 1 was interpretability: each component had a clear product rationale, and the system behaved conservatively when coverage was sparse. Its main limitation was that the weights and thresholds were chosen heuristically rather than learned from a target outcome. Version 2 keeps the same product motivation but replaces the hand-built score with a labeled predictive model.
+
+\section{Data Structure}
+
+The unit of analysis is a daily record indexed by:
+\[
+(\texttt{user\_id}, \texttt{provider}, \texttt{date}).
+\]
+
+Each row contains standardized wearable features such as:
+\begin{itemize}[leftmargin=1.5em]
+    \item recent completeness over 7 days,
+    \item backfill completeness over the full window,
+    \item number of baseline nights in the prior 28 days,
+    \item a stability score relative to recent history,
+    \item provider agreement on overlapping days,
+    \item whether the row contains a readiness score or only an HRV fallback,
+    \item row-level magnitudes such as HRV, sleep efficiency, and sleep stage totals.
+\end{itemize}
+
+\section{Label Construction}
+
+Version 2 uses two snapshots of the same dataset:
+\begin{itemize}[leftmargin=1.5em]
+    \item an \emph{early} snapshot, which reflects what the product would know in near real time,
+    \item a \emph{mature} snapshot, which reflects the same rows after additional backfill arrives.
+\end{itemize}
+
+For row $i$, define:
+\[
+L_i = \mathbf{1}(\text{row is observed later in the mature snapshot with a usable signal}).
+\]
+
+This is the \texttt{label\_observed} indicator. The reliability target is only defined when $L_i = 1$.
+
+\subsection{Safe-to-Show Target}
+
+Let $Y_i$ denote the target \texttt{safe\_to\_show}. Then:
+\[
+Y_i \in \{0,1\}.
+\]
+
+If both early and mature rows contain a recovery readiness score, the rule is:
+\[
+Y_i = 1 \quad \text{if } \left|R_i^{\text{early}} - R_i^{\text{mature}}\right| \le 5.
+\]
+
+Otherwise, if the system falls back to average HRV:
+\[
+Y_i = 1 \quad \text{if } \left|H_i^{\text{early}} - H_i^{\text{mature}}\right|
+\le \max\left(5,\;0.15\left|H_i^{\text{mature}}\right|\right).
+\]
+
+If both early and mature rows also contain sleep efficiency, the project imposes an additional consistency requirement:
+\[
+\left|S_i^{\text{early}} - S_i^{\text{mature}}\right| \le 5.
+\]
+
+If these conditions fail, then $Y_i = 0$. Informally, the label answers:
+\begin{quote}
+Did the early signal remain close enough to its later, more complete version that we would consider it trustworthy?
+\end{quote}
+
+\section{Predictive Model}
+
+Let $X_i$ denote the feature vector for row $i$. The baseline model is regularized logistic regression:
+\[
+\hat{p}_i = P(Y_i = 1 \mid X_i)
+= \sigma\left(\beta_0 + X_i^\top \beta\right),
+\]
+where
+\[
+\sigma(z) = \frac{1}{1+e^{-z}}.
+\]
+
+The main predictors are:
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{completeness\_7d},
+    \item \texttt{backfill\_completeness},
+    \item \texttt{baseline\_nights\_28d},
+    \item \texttt{stability\_score},
+    \item leave-one-out \texttt{provider\_agreement\_score},
+    \item \texttt{provider\_agreement\_known},
+    \item \texttt{core\_signal\_available},
+    \item an indicator for readiness score versus HRV fallback,
+    \item provider and source-type indicators,
+    \item row-level physiological and sleep summary fields.
+\end{itemize}
+
+\subsection{Calibration}
+
+Raw logistic outputs are optionally calibrated using sigmoid calibration:
+\[
+\hat{p}_i^{\,\text{cal}} = g(\hat{p}_i),
+\]
+where $g(\cdot)$ is learned on held-out folds. The goal is not just ranking, but better probability interpretation.
+
+\section{Policy Layer}
+
+The calibrated probability is converted into an operational recommendation:
+\begin{align*}
+\texttt{show} &\quad \text{if } \hat{p}_i^{\,\text{cal}} \ge 0.75, \\
+\texttt{show\_with\_warning} &\quad \text{if } 0.50 \le \hat{p}_i^{\,\text{cal}} < 0.75, \\
+\texttt{suppress} &\quad \text{if } \hat{p}_i^{\,\text{cal}} < 0.50.
+\end{align*}
+
+Rows without a core signal are suppressed regardless of predicted probability.
+
+\section{Selective Label Observability}
+
+Not every early row becomes labelable later. This creates a selection problem: the labeled subset may not be representative of all rows seen at scoring time.
+
+To address this, the project models the probability that a label is observed:
+\[
+\pi(X_i) = P(L_i = 1 \mid X_i).
+\]
+
+This is fit with a second logistic regression. For labeled rows, the inverse probability weight is:
+\[
+w_i = \frac{1}{\pi(X_i)}.
+\]
+
+In implementation, $\pi(X_i)$ is clipped away from zero for numerical stability.
+
+\section{Evaluation Metrics}
+
+\subsection{Standard Predictive Metrics}
+
+For labeled rows, the project reports:
+
+\paragraph{Brier score}
+\[
+\text{Brier} = \frac{1}{n}\sum_{i=1}^n (Y_i - \hat{p}_i^{\,\text{cal}})^2.
+\]
+
+\paragraph{Log loss}
+\[
+\text{LogLoss}
+= -\frac{1}{n}\sum_{i=1}^n
+\left[
+Y_i \log \hat{p}_i^{\,\text{cal}} + (1-Y_i)\log(1-\hat{p}_i^{\,\text{cal}})
+\right].
+\]
+
+\paragraph{Show precision}
+Let
+\[
+A_i = \mathbf{1}(\hat{p}_i^{\,\text{cal}} \ge 0.75).
+\]
+Then:
+\[
+\text{ShowPrecision} = \frac{\sum_i A_i Y_i}{\sum_i A_i}.
+\]
+
+\paragraph{Show coverage}
+\[
+\text{Coverage} = \frac{1}{n}\sum_{i=1}^n A_i.
+\]
+
+\subsection{IPW-Corrected Evaluation}
+
+Because labels are selectively observed, the project also computes weighted metrics. For example, the IPW Brier score is:
+\[
+\text{Brier}_{\text{IPW}}
+=
+\frac{\sum_i w_i (Y_i - \hat{p}_i^{\,\text{cal}})^2}{\sum_i w_i}.
+\]
+
+Similarly, weighted show precision is:
+\[
+\text{ShowPrecision}_{\text{IPW}}
+=
+\frac{\sum_i w_i A_i Y_i}{\sum_i w_i A_i}.
+\]
+
+These metrics attempt to reweight the labeled subset toward the full early-scoring population.
+
+\subsection{AIPW-Style Summary}
+
+For scalar summaries, the project also computes an augmented inverse probability weighted quantity. Let:
+\begin{itemize}[leftmargin=1.5em]
+    \item $q_i = \hat{p}_i^{\,\text{cal}}$ be the outcome model,
+    \item $\pi_i = \pi(X_i)$ be the observation propensity,
+    \item $L_i$ indicate whether the label is observed.
+\end{itemize}
+
+The pseudo-outcome is:
+\[
+\phi_i = q_i + \frac{L_i}{\pi_i}(Y_i - q_i).
+\]
+
+Then an estimated safe-to-show rate is:
+\[
+\hat{\mu}_{\text{AIPW}} = \frac{1}{n}\sum_{i=1}^n \phi_i.
+\]
+
+For the policy that shows only high-probability rows, the estimated policy value is:
+\[
+\hat{V} = \frac{\sum_i A_i \phi_i}{\sum_i A_i}.
+\]
+
+This is not a causal estimate of the effect of showing the signal. Rather, it is a debiasing tool for evaluating predictive reliability when only some outcomes become observable.
+
+\section{Strengths}
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{A real predictive target.} The model no longer depends entirely on hand-chosen weights. Instead, it learns from a concrete operational target: whether an early signal stays close to a mature version.
+    \item \textbf{Product alignment.} The output is directly useful in a product setting because it supports a decision rule: show, show with warning, or suppress.
+    \item \textbf{Interpretability.} Logistic regression, calibrated probabilities, and explicit thresholds are easy to explain to both technical and product audiences.
+    \item \textbf{Methodological discipline.} IPW and AIPW are used where they are appropriate: correcting evaluation under selective label observability, rather than being inserted decoratively.
+    \item \textbf{Reproducibility.} Archived runs make the modeling process inspectable across iterations.
+\end{enumerate}
+
+\section{Limitations}
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Proxy target.} The label measures stability of the early signal relative to a mature signal, not clinical truth or downstream health benefit.
+    \item \textbf{Small effective sample size.} The current project is still best framed as a proof of concept. Live sandbox data remains limited, so the learned probabilities should not be oversold as production-ready.
+    \item \textbf{Dependence on observability assumptions.} IPW and AIPW require the label-observation process to be adequately modeled from observed covariates. Unmeasured selection factors can still bias results.
+    \item \textbf{Thresholds remain policy choices.} Even if the probability model is learned, the cutoffs for show, warning, and suppress still reflect product judgment.
+    \item \textbf{Linear baseline model.} Logistic regression is intentionally simple and interpretable, but it may miss nonlinear interactions that richer models could capture later.
+\end{enumerate}
+
+\section{Practical Interpretation}
+
+The contribution of this model is not a claim that it perfectly measures health status. Its contribution is narrower and more defensible:
+\begin{quote}
+It provides a principled way to estimate whether a wearable-derived recovery signal is reliable enough to surface before the data fully matures.
+\end{quote}
+
+That makes it a strong applied data science artifact for Junction because it combines:
+\begin{itemize}[leftmargin=1.5em]
+    \item feature engineering on messy wearable data,
+    \item predictive modeling,
+    \item calibrated uncertainty,
+    \item causal-style correction for selection into the labeled subset,
+    \item and product-facing decision logic.
+\end{itemize}
+
+\section{Conclusion}
+
+Version 2 improves substantially on Version 1. It replaces a heuristic reliability score with a learned probability model, adds a principled evaluation correction for selective label observability, and preserves the iterative evidence trail through archived runs. At the same time, it should still be presented honestly as a proof-of-concept methodology project rather than a fully validated production system.
+
+\end{document}

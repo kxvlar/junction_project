@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "junction-portfolio"
+version = "0.1.0"
+description = "A Junction-native wearables reliability case study for recovery-style signals."
+requires-python = ">=3.11"
+dependencies = [
+  "matplotlib>=3.8",
+  "numpy>=2.0",
+  "pandas>=2.2",
+  "requests>=2.32",
+  "scikit-learn>=1.5",
+  "statsmodels>=0.14",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
